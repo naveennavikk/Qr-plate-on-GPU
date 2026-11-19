@@ -155,8 +155,10 @@ def result(
     remark=None,
     manual_review=False,
     manual_review_reason=None,
+    match_status=None,
+    match_reason=None,
 ):
-    """Return only the fields the existing frontend needs to update its record."""
+    """Return the decision and review details for the frontend and API client."""
     response = {
         "QRStatus": qr_status,
         "Remark": remark,
@@ -168,6 +170,10 @@ def result(
         response["houseId"] = images.houseId
     if manual_review_reason:
         response["manual_review_reason"] = manual_review_reason
+    if match_status is not None:
+        response["match_status"] = match_status
+    if match_reason:
+        response["match_reason"] = match_reason
     return response
 
 
@@ -334,19 +340,38 @@ def process_pair(images: ImagePair):
             qr_status=None,
             remark=images.Remark,
             manual_review=True,
+            match_status="uncertain",
             manual_review_reason=match.get(
                 "manual_review_reason",
                 "The matcher could not confidently verify the plate and surrounding background.",
             ),
         )
     if not match.get("contains_reference"):
+        if match.get("detection_method") == "QR identity and background mismatch":
+            match_reason = (
+                "The decoded QR values differ, and the color beside the plate "
+                "does not match the reference background."
+            )
+        elif match.get("detection_method") == "QR payload mismatch":
+            match_reason = "The reference and property images contain different decoded QR values."
+        elif match.get("detection_method") == "QR background context mismatch":
+            match_reason = (
+                "A QR/plate candidate was located, but the local background score "
+                "and the color beside the plate did not meet the match threshold."
+            )
+        else:
+            match_reason = "The matcher could not find enough evidence that the reference plate is in the property image."
         return result(
             images,
             qr_status=0,
             remark="Reference plate or its surrounding background does not match the property image.",
+            match_status="not_matched",
+            match_reason=match_reason,
         )
     # As in the UI workflow, inspect only the reference plate photo after a match.
-    return inspect_reference(reference, images)
+    inspection = inspect_reference(reference, images)
+    inspection["match_status"] = "matched"
+    return inspection
 
 
 @app.post("/api/inspect/batch")

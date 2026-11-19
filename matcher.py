@@ -6,9 +6,11 @@ from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
 
 
 class HybridImageMatcher:
-    # Calibrated against the uploaded distant-plate examples: tolerate lighting
-    # and perspective changes while remaining above tested different-wall pairs.
-    BACKGROUND_SIMILARITY_THRESHOLD = 0.55
+    # A plate match requires the nearby wall/panel color and texture to agree.
+    BACKGROUND_SIMILARITY_THRESHOLD = 0.65
+    # Values below this indicate a clearly different backing surface. The gray
+    # band between this and the match threshold remains eligible for review.
+    BACKGROUND_MISMATCH_THRESHOLD = 0.60
 
     def __init__(self, device=None):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -21,7 +23,7 @@ class HybridImageMatcher:
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
 
     def _find_qr_boxes(self, rgb_image):
-        """Locate QR symbols without reading or comparing their payloads."""
+        """Locate QR symbols and return their corner boxes."""
         gray = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2GRAY)
         boxes = []
         for scale in (1.0, 1.5, 2.0, 2.5, 3.0):
@@ -60,6 +62,52 @@ class HybridImageMatcher:
                     x2, y2 = np.ceil(coords.max(axis=0)).astype(int)
                     boxes.append([x1, y1, x2, y2])
         return boxes
+
+    @staticmethod
+    def _decoded_qr_payloads(rgb_image):
+        """Return QR payloads decoded locally; callers never log or persist them."""
+        h, w = rgb_image.shape[:2]
+        scale_down = min(1.0, 1800 / max(h, w))
+        if scale_down < 1.0:
+            rgb_image = cv2.resize(
+                rgb_image,
+                (round(w * scale_down), round(h * scale_down)),
+                interpolation=cv2.INTER_AREA,
+            )
+        gray = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2GRAY)
+        payloads = set()
+        for scale in (1.0, 2.0, 3.0):
+            scaled = gray if scale == 1.0 else cv2.resize(
+                gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
+            )
+            block_size = min(21, min(scaled.shape) // 2 * 2 - 1)
+            variants = [scaled]
+            if block_size >= 3:
+                variants.append(
+                    cv2.adaptiveThreshold(
+                        scaled,
+                        255,
+                        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                        cv2.THRESH_BINARY,
+                        block_size,
+                        5,
+                    )
+                )
+            for variant in variants:
+                detector = cv2.QRCodeDetector()
+                try:
+                    decoded = detector.detectAndDecodeMulti(variant)
+                    if len(decoded) >= 2 and decoded[0]:
+                        payloads.update(value for value in decoded[1] if value)
+                except (cv2.error, ValueError):
+                    pass
+                try:
+                    value, _, _ = detector.detectAndDecode(variant)
+                    if value:
+                        payloads.add(value)
+                except cv2.error:
+                    pass
+        return payloads
 
     @staticmethod
     def _plate_crop_without_qr(ref_rgb):
@@ -107,7 +155,7 @@ class HybridImageMatcher:
 
     @staticmethod
     def _background_similarity(ref_rgb, ref_box, scene_rgb, scene_box):
-        """Compare color and surface texture surrounding two detected QR symbols."""
+        """Compare wall color and texture outside the plate around two QR symbols."""
         def ring_signature(image, box):
             x1, y1, x2, y2 = box
             x1 = max(0, min(image.shape[1] - 1, int(x1)))
@@ -115,17 +163,20 @@ class HybridImageMatcher:
             x2 = max(x1 + 1, min(image.shape[1], int(x2)))
             y2 = max(y1 + 1, min(image.shape[0], int(y2)))
             qr_w, qr_h = max(1, x2 - x1), max(1, y2 - y1)
-            margin_x, margin_y = int(qr_w * 2.0), int(qr_h * 2.0)
+            # Sample the immediate wall around the plaque, then mask an estimated
+            # plaque-sized center region so its white surface cannot stand in for
+            # the wall. A much wider crop includes unrelated doors and walls.
+            margin_x, margin_y = int(qr_w * 1.5), int(qr_h * 1.5)
             ox1, oy1 = max(0, x1 - margin_x), max(0, y1 - margin_y)
             ox2, oy2 = min(image.shape[1], x2 + margin_x), min(image.shape[0], y2 + margin_y)
             patch = image[oy1:oy2, ox1:ox2]
             mask = np.ones(patch.shape[:2], dtype=np.uint8) * 255
-            ix1 = max(0, x1 - ox1 - int(qr_w * .15))
-            iy1 = max(0, y1 - oy1 - int(qr_h * .15))
-            ix2 = min(patch.shape[1], x2 - ox1 + int(qr_w * .15))
-            iy2 = min(patch.shape[0], y2 - oy1 + int(qr_h * .15))
+            ix1 = max(0, x1 - ox1 - int(qr_w * 1.5))
+            iy1 = max(0, y1 - oy1 - int(qr_h * .8))
+            ix2 = min(patch.shape[1], x2 - ox1 + int(qr_w * 1.5))
+            iy2 = min(patch.shape[0], y2 - oy1 + int(qr_h * .8))
             mask[iy1:iy2, ix1:ix2] = 0
-            if cv2.countNonZero(mask) < 20:
+            if cv2.countNonZero(mask) < 80:
                 return None
             lab = cv2.cvtColor(patch, cv2.COLOR_RGB2LAB)
             color_hist = cv2.calcHist([lab], [0, 1, 2], mask, [8, 8, 8], [0, 256, 0, 256, 0, 256])
@@ -141,7 +192,9 @@ class HybridImageMatcher:
             texture_hist = texture_hist.astype(np.float32)
             texture_hist /= max(float(texture_hist.sum()), 1e-6)
             mean_lab = np.asarray(cv2.mean(lab, mask=mask)[:3], dtype=np.float32)
-            return color_hist, texture_hist, mean_lab
+            edges = cv2.Canny(cv2.GaussianBlur(gray, (3, 3), 0), 40, 110)
+            edge_density = float(np.mean(edges[valid] > 0))
+            return color_hist, texture_hist, mean_lab, edge_density
 
         ref_sig = ring_signature(ref_rgb, ref_box)
         scene_sig = ring_signature(scene_rgb, scene_box)
@@ -153,41 +206,60 @@ class HybridImageMatcher:
         )
         mean_color_distance = float(np.linalg.norm(ref_sig[2] - scene_sig[2]))
         mean_color_similarity = max(0.0, 1.0 - mean_color_distance / 100.0)
-        similarity = float(.55 * color_similarity + .2 * texture_similarity + .25 * mean_color_similarity)
-        # When the two QR crops are similarly sized, compare surface detail too.
-        # This catches smooth-vs-rough walls that have similar average colors and
-        # gradient directions. Skip this term for distant plates because blur and
-        # downsampling naturally erase fine texture.
+        # Keep the broad color/texture score continuous; the adjacent side color
+        # check below is the explicit veto for a different backing surface.
+        similarity = float(.45 * color_similarity + .2 * texture_similarity + .35 * mean_color_similarity)
+        # When QR sizes are comparable, also require the wall's edge density to
+        # agree. The same masked plaque region is used for this comparison.
         ref_scale = (ref_box[2] - ref_box[0], ref_box[3] - ref_box[1])
         scene_scale = (scene_box[2] - scene_box[0], scene_box[3] - scene_box[1])
         scale_x = scene_scale[0] / max(1, ref_scale[0])
         scale_y = scene_scale[1] / max(1, ref_scale[1])
         if .7 <= scale_x <= 1.4 and .7 <= scale_y <= 1.4:
-            ref_edges = cv2.Canny(cv2.GaussianBlur(
-                cv2.cvtColor(ref_rgb, cv2.COLOR_RGB2GRAY), (3, 3), 0
-            ), 40, 110)
-            scene_edges = cv2.Canny(cv2.GaussianBlur(
-                cv2.cvtColor(scene_rgb, cv2.COLOR_RGB2GRAY), (3, 3), 0
-            ), 40, 110)
-
-            def ring_edge_density(edges, box):
-                x1, y1, x2, y2 = map(int, box)
-                qw, qh = max(1, x2 - x1), max(1, y2 - y1)
-                ox1, oy1 = max(0, x1 - int(qw * 2)), max(0, y1 - int(qh * 2))
-                ox2, oy2 = min(edges.shape[1], x2 + int(qw * 2)), min(edges.shape[0], y2 + int(qh * 2))
-                patch = edges[oy1:oy2, ox1:ox2]
-                mask = np.ones(patch.shape[:2], dtype=bool)
-                ix1 = max(0, x1 - ox1 - int(qw * .15))
-                iy1 = max(0, y1 - oy1 - int(qh * .15))
-                ix2 = min(patch.shape[1], x2 - ox1 + int(qw * .15))
-                iy2 = min(patch.shape[0], y2 - oy1 + int(qh * .15))
-                mask[iy1:iy2, ix1:ix2] = False
-                return float(np.mean(patch[mask] > 0)) if np.any(mask) else 0.0
-
-            ref_density = ring_edge_density(ref_edges, ref_box)
-            scene_density = ring_edge_density(scene_edges, scene_box)
+            ref_density, scene_density = ref_sig[3], scene_sig[3]
             density_similarity = min(ref_density, scene_density) / max(ref_density, scene_density, 1e-6)
             similarity = .75 * similarity + .25 * density_similarity
+
+        def side_colors(image, box):
+            x1, y1, x2, y2 = map(int, box)
+            qr_w, qr_h = max(1, x2 - x1), max(1, y2 - y1)
+            plate_x1 = max(0, round(x1 - .18 * qr_w))
+            plate_y1 = max(0, round(y1 - .10 * qr_h))
+            plate_x2 = min(image.shape[1], round(x2 + .85 * qr_w))
+            plate_y2 = min(image.shape[0], round(y2 + .10 * qr_h))
+            band = max(2, round((plate_x2 - plate_x1) * .35))
+            means = {}
+            for side, (xa, xb) in {
+                "left": (max(0, plate_x1 - band), plate_x1),
+                "right": (plate_x2, min(image.shape[1], plate_x2 + band)),
+            }.items():
+                if xb <= xa or plate_y2 <= plate_y1:
+                    continue
+                patch = image[plate_y1:plate_y2, xa:xb]
+                if patch.size:
+                    lab = cv2.cvtColor(patch, cv2.COLOR_RGB2LAB)
+                    # L is strongly affected by distance, shade, and camera
+                    # exposure. Compare a/b chroma here so the same gray wall
+                    # can still match when its close-up and wide-shot brightness
+                    # differ; the ring texture/color histogram still contributes
+                    # brightness evidence in the broad score above.
+                    means[side] = np.asarray(cv2.mean(lab)[1:3], dtype=np.float32)
+            return means
+
+        ref_sides = side_colors(ref_rgb, ref_box)
+        scene_sides = side_colors(scene_rgb, scene_box)
+        side_deltas = [
+            float(np.linalg.norm(ref_sides[side] - scene_sides[side]))
+            for side in ("left", "right")
+            if side in ref_sides and side in scene_sides
+        ]
+        if side_deltas:
+            # A moderate chroma shift is meaningful (for example gray concrete
+            # versus a brown/rust panel), while allowing lighting to shift L.
+            side_color_similarity = float(
+                np.mean([max(0.0, 1.0 - delta / 30.0) for delta in side_deltas])
+            )
+            similarity = .45 * similarity + .55 * side_color_similarity
         return float(similarity)
 
     @staticmethod
@@ -410,21 +482,61 @@ class HybridImageMatcher:
         height, width = prop_gray.shape
         reference_qrs = self._find_qr_boxes(ref)
 
+        reference_payloads = self._decoded_qr_payloads(ref)
+        if reference_payloads:
+            property_payloads = self._decoded_qr_payloads(prop)
+            if (
+                len(reference_payloads) == 1
+                and len(property_payloads) == 1
+                and not reference_payloads.intersection(property_payloads)
+            ):
+                property_qrs = self._find_qr_boxes(prop)
+                background_scores = [
+                    self._background_similarity(ref, reference_qrs[0], prop, candidate)
+                    for candidate in property_qrs
+                ] if reference_qrs else []
+                best_background = max(background_scores, default=None)
+                background_mismatch = (
+                    best_background is not None
+                    and best_background < self.BACKGROUND_MISMATCH_THRESHOLD
+                )
+                return {
+                    "contains_reference": False,
+                    "detection_method": (
+                        "QR identity and background mismatch"
+                        if background_mismatch
+                        else "QR payload mismatch"
+                    ),
+                    "background_similarity": best_background,
+                }
+
         # First locate the QR plate candidate using its visual details. Then
         # compare the background only around that candidate in the property photo.
-        # QR payloads / printed plate IDs are deliberately not read or compared.
+        # Compare the narrow QR crop for geometric features and a wider crop
+        # including plate details for template search. Keeping them separate
+        # prevents repeated shutter lines from matching as QR data.
         ref_h, ref_w = ref_gray.shape
         plate_crop = ref_gray
         plate_box = (0, 0, ref_w, ref_h)
+        qr_crop = ref_gray
+        qr_crop_box = (0, 0, ref_w, ref_h)
         if reference_qrs:
-            # Isolate the detected QR symbol for the first-stage location search.
-            # Background is evaluated only after this QR candidate is projected
-            # into the property image below.
-            x1, y1, x2, y2 = reference_qrs[0]
-            qr_w, qr_h = max(1, x2 - x1), max(1, y2 - y1)
-            margin_x, margin_y = max(2, int(qr_w * 0.06)), max(2, int(qr_h * 0.06))
-            x1, y1 = max(0, x1 - margin_x), max(0, y1 - margin_y)
-            x2, y2 = min(ref_w, x2 + margin_x), min(ref_h, y2 + margin_y)
+            qx1, qy1, qx2, qy2 = reference_qrs[0]
+            qr_w, qr_h = max(1, qx2 - qx1), max(1, qy2 - qy1)
+            qr_margin_x, qr_margin_y = max(2, int(qr_w * .06)), max(2, int(qr_h * .06))
+            qx1, qy1 = max(0, qx1 - qr_margin_x), max(0, qy1 - qr_margin_y)
+            qx2, qy2 = min(ref_w, qx2 + qr_margin_x), min(ref_h, qy2 + qr_margin_y)
+            qr_crop = ref_gray[qy1:qy2, qx1:qx2]
+            qr_crop_box = (qx1, qy1, qx2, qy2)
+
+            # Include the plate's printed details beside the QR. Those details
+            # help identify small, distant plates when the QR modules alone are
+            # too compressed for a distinctive template score.
+            margin_x, margin_y = max(2, int(qr_w * 0.45)), max(2, int(qr_h * 0.15))
+            x1 = max(0, reference_qrs[0][0] - margin_x)
+            y1 = max(0, reference_qrs[0][1] - margin_y)
+            x2 = min(ref_w, reference_qrs[0][2] + margin_x)
+            y2 = min(ref_h, reference_qrs[0][3] + margin_y)
             plate_crop = ref_gray[y1:y2, x1:x2]
             plate_box = (x1, y1, x2, y2)
         else:
@@ -436,11 +548,11 @@ class HybridImageMatcher:
 
         # Locate a candidate plate before evaluating the background around it.
         if reference_qrs:
-            qr_match = self._match_region(plate_crop, prop_gray)
+            qr_match = self._match_region(qr_crop, prop_gray)
             if qr_match:
                 inliers, inlier_ratio, bbox = qr_match
                 x1, y1, x2, y2 = bbox
-                projected_qr = self._map_context_box(plate_box, bbox, reference_qrs[0])
+                projected_qr = self._map_context_box(qr_crop_box, bbox, reference_qrs[0])
                 projected_background = self._background_similarity(
                     ref, reference_qrs[0], prop, projected_qr
                 )
@@ -458,85 +570,148 @@ class HybridImageMatcher:
                         "candidate_qr_box": projected_qr,
                         "detection_method": "QR features and surrounding background",
                     }
-                # A strong geometric QR match with a failed background check is
-                # a decisive rejection. Do not let a weaker repeated pattern or
-                # watermark elsewhere in the photo override the same candidate.
-                return {
-                    "contains_reference": False,
-                    "detection_method": "QR background context mismatch",
-                    "background_similarity": projected_background,
-                    "feature_inliers": inliers,
-                    "match_score": inlier_ratio,
-                    "candidate_qr_box": projected_qr,
-                }
+                if projected_background < self.BACKGROUND_MISMATCH_THRESHOLD:
+                    return {
+                        "contains_reference": False,
+                        "detection_method": "QR background context mismatch",
+                        "background_similarity": projected_background,
+                        "feature_inliers": inliers,
+                        "match_score": inlier_ratio,
+                        "candidate_qr_box": projected_qr,
+                    }
+                # Context in the gray zone is inconclusive. Let template matching
+                # evaluate the wider plate crop before deciding.
         # Search every location at multiple scales. Full sliding matching avoids
         # missing a small, distant QR that falls between fixed grid sample points.
         template_matches = self._template_search(plate_crop, prop_gray)
-        # This score only nominates a QR candidate. Background context below is a
-        # separate required check, so a weak visual candidate cannot pass alone.
-        template_threshold = 0.60
-        if template_matches and template_matches[0][0] >= template_threshold:
-            best_score = template_matches[0][0]
-            accepted = None
-            best_background = None
-            best_background_box = None
-            for score, bbox in template_matches:
-                if score < template_threshold:
+        # Search the whole visible plate region, but require its nearby side
+        # color and background texture to agree before accepting a candidate.
+        template_threshold = 0.70
+        high_score_candidate_unaccepted = bool(
+            template_matches
+            and template_matches[0][0] >= template_threshold
+            and reference_qrs
+        )
+        if (
+            template_matches
+            and template_matches[0][0] >= template_threshold
+            and not reference_qrs
+        ):
+            return {
+                "contains_reference": False,
+                "detection_method": "QR candidate found but background could not be validated",
+                "best_template_score": template_matches[0][0],
+            }
+        # Moderate plate matches still need enough local background agreement.
+        weak_template_min = 0.50
+        strong_context_threshold = 0.75
+        moderate_context_score = 0.65
+        moderate_template_score = 0.52
+        if (
+            reference_qrs
+            and template_matches
+            and weak_template_min <= template_matches[0][0]
+            and (
+                template_matches[0][0] < template_threshold
+                or high_score_candidate_unaccepted
+            )
+        ):
+            candidate_evidence = []
+            for score, candidate_box in template_matches:
+                if score < weak_template_min:
                     break
-                if not reference_qrs:
-                    continue
-                projected_qr = self._map_context_box(plate_box, bbox, reference_qrs[0])
+                projected_qr = self._map_context_box(
+                    plate_box, candidate_box, reference_qrs[0]
+                )
                 background_score = self._background_similarity(
                     ref, reference_qrs[0], prop, projected_qr
                 )
-                if best_background is None or background_score > best_background:
-                    best_background = background_score
-                    best_background_box = projected_qr
-                if background_score >= self.BACKGROUND_SIMILARITY_THRESHOLD:
-                    accepted = (score, bbox, background_score, projected_qr)
-                    break
-            if not reference_qrs:
+                combined_score = 0.75 * score + 0.25 * background_score
+                candidate_evidence.append(
+                    (
+                        combined_score,
+                        background_score,
+                        score,
+                        candidate_box,
+                        projected_qr,
+                    )
+                )
+            candidate_evidence.sort(reverse=True, key=lambda item: item[0])
+            if candidate_evidence:
+                (
+                    combined_score,
+                    background_score,
+                    score,
+                    bbox,
+                    candidate_qr_box,
+                ) = candidate_evidence[0]
+                runner_up_combined = (
+                    candidate_evidence[1][0] if len(candidate_evidence) > 1 else 0.0
+                )
+                context_confident = (
+                    background_score >= strong_context_threshold
+                    or (
+                        score >= moderate_template_score
+                        and background_score >= moderate_context_score
+                    )
+                )
+                combined_confident = (
+                    score >= 0.60
+                    and background_score >= self.BACKGROUND_SIMILARITY_THRESHOLD
+                    and combined_score >= 0.56
+                    and combined_score - runner_up_combined >= 0.015
+                )
+                if context_confident or combined_confident:
+                    scale_x = (bbox[2] - bbox[0]) / max(1, plate_crop.shape[1])
+                    scale_y = (bbox[3] - bbox[1]) / max(1, plate_crop.shape[0])
+                    bbox = [
+                        round(bbox[0] - plate_box[0] * scale_x),
+                        round(bbox[1] - plate_box[1] * scale_y),
+                        round(bbox[2] + (ref_w - plate_box[2]) * scale_x),
+                        round(bbox[3] + (ref_h - plate_box[3]) * scale_y),
+                    ]
+                    x1, y1, x2, y2 = bbox
+                    return {
+                        "contains_reference": True,
+                        "bbox": [
+                            max(0, round(x1 / property_scale)),
+                            max(0, round(y1 / property_scale)),
+                            min(property_img.width, round(x2 / property_scale)),
+                            min(property_img.height, round(y2 / property_scale)),
+                        ],
+                        "match_score": score,
+                        "background_similarity": background_score,
+                        "candidate_qr_box": candidate_qr_box,
+                        "detection_method": (
+                            "Combined plate and background match"
+                            if combined_confident and not context_confident
+                            else "Moderate QR match with strong surrounding background"
+                        ),
+                    }
+                if background_score < self.BACKGROUND_MISMATCH_THRESHOLD:
+                    return {
+                        "contains_reference": False,
+                        "detection_method": "QR background context mismatch",
+                        "background_similarity": background_score,
+                        "best_template_score": score,
+                        "candidate_qr_box": candidate_qr_box,
+                    }
                 return {
                     "contains_reference": False,
-                    "detection_method": "QR candidate found but background could not be validated",
-                    "best_template_score": best_score,
+                    "needs_manual_review": True,
+                    "detection_method": "manual_review",
+                    "manual_review_reason": (
+                        "The QR plate candidate is plausible, but its nearby background "
+                        "and side color did not meet the automatic match threshold."
+                    ),
+                    "background_similarity": background_score,
+                    "best_template_score": score,
+                    "candidate_qr_box": candidate_qr_box,
                 }
-            if accepted is None:
-                return {
-                    "contains_reference": False,
-                    "detection_method": "QR background context mismatch",
-                    "background_similarity": best_background,
-                    "best_template_score": best_score,
-                    "candidate_qr_box": best_background_box,
-                }
-            score, bbox, projected_background, candidate_qr_box = accepted
-            if reference_qrs and plate_box:
-                # Report the whole plate area, not only the thresholded white surface.
-                scale_x = (bbox[2] - bbox[0]) / max(1, plate_crop.shape[1])
-                scale_y = (bbox[3] - bbox[1]) / max(1, plate_crop.shape[0])
-                bbox = [
-                    round(bbox[0] - plate_box[0] * scale_x),
-                    round(bbox[1] - plate_box[1] * scale_y),
-                    round(bbox[2] + (ref_w - plate_box[2]) * scale_x),
-                    round(bbox[3] + (ref_h - plate_box[3]) * scale_y),
-                ]
-            x1, y1, x2, y2 = bbox
-            return {
-                "contains_reference": True,
-                "bbox": [
-                    max(0, round(x1 / property_scale)), max(0, round(y1 / property_scale)),
-                    min(property_img.width, round(x2 / property_scale)),
-                    min(property_img.height, round(y2 / property_scale)),
-                ],
-                "match_score": score,
-                "background_similarity": projected_background if reference_qrs else None,
-                "candidate_qr_box": candidate_qr_box,
-                "detection_method": "Localized plate template matching",
-            }
         # If corner detection fails (common for tiny, blurry plates), nominate
         # bright plate-like scene regions first, then compare them with the
-        # reference crop and validate their local background. This still avoids
-        # accepting on printed IDs or generic wall similarity alone.
+        # reference crop and validate their local background. This avoids
+        # accepting on generic wall similarity alone.
         if reference_qrs and target_prompt.strip():
             try:
                 labels = ["qr code"] + [
